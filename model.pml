@@ -8,14 +8,14 @@ typedef places_status {
 }; 
 
 
-/* Еще один аргумент в виде массива или места? Другой канал? */
 chan server_channel = [2] of {mtype, byte, byte};
 chan user_channel[USER_NUM] = [1] of {mtype, byte};
 chan user_channel_places[USER_NUM] = [1] of { places_status };
 
+
 mtype = {
 	/* user actions */
-	user_send_id, user_select_place, user_purchase, request_places,
+	start_session, user_select_place, user_purchase, request_places, end_session,
 	/* server responses */
 	server_send_places, server_purchase_result, success, error,
 	/* place status */
@@ -23,35 +23,56 @@ mtype = {
 };
 
 proctype user(byte uid; byte place_to_choose) {
-	printf("MSC: User %d want to buy place %d. Send init message.\n", uid, place_to_choose);
+	places_status places;
+	byte places_fail = 0;
+
+	printf("MSC: User %d send init message.\n", uid);
+	
+	/* Start session. Send id data to server */
 	/* 0 value as second argument in server_channel request - null value */
+	server_channel ! start_session (uid, 0);
 	
-	/* send id data to server */
-	server_channel ! user_send_id (uid, 0);
-	
-	user_channel[uid] ? success; /* expected success response from server? */
+	/* expected success response from server */
+	user_channel[uid] ? success;
 
-
-	printf("MSC: Sucess init message from server. User %d request for places statuses\n", uid);
+	printf("MSC: Success init message from server. User %d request for places statuses\n", uid);
 	
 	/* request for places statuses */
-	server_channel ! request_places (uid, 0);
-	
-	places_status places;
+	select_place_label: server_channel ! request_places (uid, 0);
 	
 	user_channel_places[uid] ? places;
 
-	printf("MSC: User %d desired place %d has been purchased: %e\n", uid, place_to_choose, places.status[place_to_choose]);
+	printf("MSC: User %d desired place %d has status %e\n", uid, place_to_choose, places.status[place_to_choose]);
 	
-	/* expected for place_to_choose to be free. Otherwise stack in this place */
-	places.status[place_to_choose] == free;
+	/* expected for place_to_choose to be free. Otherwise select new place */
+	if
+		:: places_fail == PLACE_NUM -> 
+			goto end_session_label;
+		:: places.status[place_to_choose] == free -> 
+			skip;
+		:: places.status[place_to_choose] == reserved -> 
+			goto select_place_label;
+		:: places.status[place_to_choose] == bought && places_fail != PLACE_NUM ->
+			if
+				:: place_to_choose < PLACE_NUM -> place_to_choose++;
+				:: else -> place_to_choose = 0;
+			fi;
+			places_fail++;
+			printf("MSC: Selected by user %d place is bought. Select new one %d\n", uid, place_to_choose);
+			goto select_place_label;
+	fi;
+	
+	end: places.status[place_to_choose] == free;
 
-	printf("MSC: User %d going to buy desired place %d\n", uid, place_to_choose);
+	printf("MSC: User %d is going to buy desired place %d\n", uid, place_to_choose);
 	
 	/* reserve place */
 	server_channel ! user_select_place (uid, place_to_choose);
 	
-	user_channel[uid] ? success;
+	if
+		:: user_channel[uid] ? success -> skip;
+		:: user_channel[uid] ? error -> goto select_place_label;
+	fi;	
 
 	printf("MSC: User %d sucessfully reserve place\n", uid);
 	
@@ -64,16 +85,25 @@ proctype user(byte uid; byte place_to_choose) {
 
 	assert(retrieved_uid == uid);
 
-	printf("MSC: User %d success :3\n", uid);
+	printf("MSC: User %d successfully buy ticket :3\n", uid);
+
+	end_session_label: server_channel ! end_session (uid, 0);
+
+	user_channel[uid] ? success;
+
+	printf("MSC: User %d end session\n", uid);
 }
 
 proctype server() {
 	places_status places;
 	bool users[USER_NUM];
+	byte purchases = 0;
+	byte active_users = 0;
 
+	/* init places */
 	byte i = 0;
 	do
-		:: i < PLACE_NUM -> places.status[i] = free; i = i + 1;
+		:: i < PLACE_NUM -> places.status[i] = free; places.by_actual[i] = false; i++;
 		:: else -> break;
 	od;	
 	
@@ -81,12 +111,36 @@ proctype server() {
 	byte uid;
 	byte place; 
 	
-	do 
-		/* save user id. send success response? */
-		/* authorize user */
-		:: server_channel ? user_send_id (uid, 0) ->
-			users[uid] = true;
-			user_channel[uid] ! success;
+	end: do 
+		/* authorize user, save user id */
+		:: server_channel ? start_session (uid, 0) ->
+			if
+				:: (users[uid] == false) -> 
+					atomic {
+						users[uid] = true; 
+						active_users++;
+					}
+
+					user_channel[uid] ! success;
+				:: else -> 
+					/* if user already authorizes then error response */
+					user_channel[uid] ! error;
+			fi;
+
+		/* end session */
+		:: server_channel ? end_session (uid, 0) ->
+			if
+				:: (users[uid] == true) -> 
+					atomic {
+						users[uid] = false; 
+						active_users--;
+					}
+					
+					user_channel[uid] ! success;
+				:: else -> 
+					/* if user is not authorized then error response */
+					user_channel[uid] ! error;
+			fi;
 			
  		/* return places statuses */
 		:: server_channel ? request_places (uid, 0) ->
@@ -101,7 +155,6 @@ proctype server() {
 				:: (users[uid] == true && places.status[place] == free) -> 
 					printf("MSC: Select place %d for user %d\n", place, uid);
 					atomic {
-						/* maybe without atomic? */
 						places.status[place] = reserved;
 						places.by_actual[place] = true;
 						places.by[place] = uid;
@@ -126,24 +179,45 @@ proctype server() {
 					printf("MSC: Purchase place %d for user %d\n", place, uid);
 					/* buy place */
 					atomic {
-						/* maybe without atomic? */
 						places.status[place] = bought;
-						places.by_actual[place] = true;
-						places.by[place] = uid;
+						purchases++;
 					}
 					
 					/* get uid from users array */
 					user_channel[uid] ! success (places.by[place]);
 				:: else -> 
-					user_channel[uid] ! error; /* if user is not authorized then error response */
+					/* if user is not authorized then error response */
+					user_channel[uid] ! error;
 			fi;
+
+		:: purchases == PLACE_NUM || purchases == USER_NUM ->
+			if
+				:: (active_users == 0 && len(server_channel) == 0) -> 
+					printf("MSC: All places are sold out!\n");
+					break;
+				:: else ->
+					skip;
+			fi;
+
+		:: else ->
+			skip;
 	od;
 }
 
 init {
+	
 	atomic {
-		run server();
-		run user(0, 0);
-		run user(1, 2);
+		run server();	
+
+		/* Simulation 1 */
+		byte i = 0;
+		do
+			:: i < USER_NUM -> run user(i, i); i++;
+			:: else -> break;
+		od;
+
+		/* Simulation 2 */
+		// run user(0, 0);
+		// run user(1, 0);
 	}
 }
